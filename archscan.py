@@ -1,12 +1,12 @@
-
 import os
 import re
 import argparse
 from typing import List, Dict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
-from rich.text import Text
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
 
 console = Console()
 
@@ -56,33 +56,41 @@ RULES = [
     },
     {
         "id": "R07",
-        "name": "Sudo Usage in PKGBUILD",
+        "name": "Sudo in Script",
         "regex": re.compile(r"\bsudo\b"),
-        "severity": "HIGH",
-        "description": "Menggunakan sudo di dalam PKGBUILD (seharusnya tidak diperlukan dan dilarang makepkg)."
+        "severity": "WARNING",
+        "description": "Menggunakan sudo di dalam skrip (bisa jadi normal, namun patut dicurigai jika tidak terduga)."
     },
     {
         "id": "R08",
-        "name": "Wget/Curl outside source array",
+        "name": "Suspicious Download",
         "regex": re.compile(r"^\s*(wget|curl)\s+"),
         "severity": "WARNING",
-        "description": "Mengunduh file secara manual alih-alih menggunakan array source()."
+        "description": "Mengunduh file dari internet secara langsung di dalam script."
     }
 ]
 
-def scan_file(filepath: str) -> List[Dict]:
+# Direktori yang harus diabaikan untuk menghindari error dan mempercepat scan
+IGNORE_DIRS = {'/proc', '/sys', '/dev', '/run', '/tmp', '/var/run', '/var/lock', '/snap', '/mnt'}
+TARGET_EXTENSIONS = ('.sh', '.bash', '.zsh', '.install')
+
+def is_target_file(filename: str) -> bool:
+    if filename == "PKGBUILD":
+        return True
+    if filename.endswith(TARGET_EXTENSIONS):
+        return True
+    return False
+
+def scan_file(filepath: str) -> Dict:
     """Memindai satu file berdasarkan rules yang ada."""
     findings = []
     try:
-        with open(filepath, 'r', encoding='utf-8') as f:
+        # errors='ignore' mencegah program crash jika menemukan karakter aneh/binary
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
             lines = f.readlines()
             
         for line_num, line in enumerate(lines, 1):
             line_clean = line.strip()
-            
-            # Skip comments unless the comment itself is suspicious (opsional, tapi biasanya malware bisa disembunyikan di string)
-            # if line_clean.startswith('#'):
-            #     continue
                 
             for rule in RULES:
                 if rule["regex"].search(line):
@@ -91,14 +99,33 @@ def scan_file(filepath: str) -> List[Dict]:
                         "content": line_clean,
                         "rule": rule
                     })
+    except PermissionError:
+        pass # Abaikan file yang tidak bisa diakses
     except Exception as e:
-        console.print(f"[bold red]Error membaca file {filepath}: {e}[/bold red]")
+        pass # Abaikan error lain agar proses pemindaian lanjut
         
-    return findings
+    return {"filepath": filepath, "findings": findings}
+
+def get_files_to_scan(target_path: str) -> List[str]:
+    files_to_scan = []
+    
+    if os.path.isfile(target_path):
+        files_to_scan.append(target_path)
+    elif os.path.isdir(target_path):
+        for root, dirs, files in os.walk(target_path):
+            # Abaikan direktori sistem yang sensitif
+            # Filter in-place pada list dirs agar os.walk tidak memasukinya
+            dirs[:] = [d for d in dirs if not any(os.path.join(root, d).startswith(ignore) for ignore in IGNORE_DIRS)]
+                
+            for file in files:
+                if is_target_file(file):
+                    files_to_scan.append(os.path.join(root, file))
+    
+    return files_to_scan
 
 def main():
-    parser = argparse.ArgumentParser(description="ArchScan - PKGBUILD Antivirus")
-    parser.add_argument("target", help="Path ke file PKGBUILD atau direktori")
+    parser = argparse.ArgumentParser(description="ArchScan - System Script Antivirus")
+    parser.add_argument("target", help="Path ke file atau direktori target (misal: / atau /home/user)")
     args = parser.parse_args()
 
     target_path = os.path.abspath(args.target)
@@ -107,29 +134,49 @@ def main():
         console.print(f"[bold red]Target {target_path} tidak ditemukan![/bold red]")
         return
         
-    files_to_scan = []
-    if os.path.isfile(target_path):
-        files_to_scan.append(target_path)
-    elif os.path.isdir(target_path):
-        for root, _, files in os.walk(target_path):
-            for file in files:
-                if file == "PKGBUILD" or file.endswith(".install"):
-                    files_to_scan.append(os.path.join(root, file))
+    console.print(Panel(f"Mengumpulkan daftar file dari [bold cyan]{target_path}[/bold cyan]...\nProses ini mungkin memakan waktu jika target adalah root (/).", title="ArchScan Engine", style="blue"))
+    
+    files_to_scan = get_files_to_scan(target_path)
                     
     if not files_to_scan:
-        console.print("[yellow]Tidak ada file PKGBUILD atau .install yang ditemukan untuk discan.[/yellow]")
+        console.print("[yellow]Tidak ada file skrip yang didukung untuk discan pada direktori tersebut.[/yellow]")
         return
 
-    console.print(Panel(f"Memulai pemindaian pada [bold cyan]{len(files_to_scan)}[/bold cyan] file...", title="ArchScan", style="blue"))
+    total_files = len(files_to_scan)
+    console.print(f"Ditemukan [bold cyan]{total_files}[/bold cyan] file untuk dipindai.\n")
     
+    all_results = []
     total_findings = 0
     
-    for file in files_to_scan:
-        findings = scan_file(file)
-        if findings:
-            total_findings += len(findings)
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("[cyan]Memindai ancaman...", total=total_files)
+        
+        # Multithreading scan
+        workers = (os.cpu_count() or 1) * 2
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(scan_file, f): f for f in files_to_scan}
+            for future in as_completed(futures):
+                result = future.result()
+                if result["findings"]:
+                    all_results.append(result)
+                    total_findings += len(result["findings"])
+                progress.advance(task)
+
+    # Cetak Hasil
+    if all_results:
+        console.print("\n[bold red]Hasil Pemindaian:[/bold red]")
+        for res in all_results:
+            filepath = res["filepath"]
+            findings = res["findings"]
             
-            table = Table(title=f"Hasil Pindaian: {os.path.basename(file)}", show_lines=True)
+            table = Table(title=f"File: {filepath}", show_lines=True, title_style="bold magenta")
             table.add_column("Line", style="cyan", justify="right", width=5)
             table.add_column("Severity", style="bold")
             table.add_column("Rule Name", style="magenta")
@@ -161,13 +208,11 @@ def main():
             
             console.print(table)
             console.print("\n")
-        else:
-            console.print(f"[green]✓ {os.path.basename(file)}: Aman. Tidak ada pola mencurigakan.[/green]")
-
+            
     if total_findings > 0:
-        console.print(f"[bold red]Peringatan: Ditemukan {total_findings} indikasi berbahaya![/bold red]")
+        console.print(f"[bold red blink]PERINGATAN: Ditemukan total {total_findings} indikasi ancaman![/bold red blink]")
     else:
-        console.print("[bold green]Semua file terlihat aman![/bold green]")
+        console.print("[bold green]Semua file terlihat aman! Tidak ditemukan ancaman.[/bold green]")
 
 if __name__ == "__main__":
     main()
